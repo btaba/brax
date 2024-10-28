@@ -115,6 +115,8 @@ def train(
     wrap_env: whether to wrap the environment for training
     num_timesteps: the total number of environment steps to use during training
     episode_length: the length of an environment episode
+    wrap_env: If True, wrap the environment for training. Otherwise use the
+      environment as is.
     action_repeat: the number of timesteps to repeat an action
     num_envs: the number of parallel environments to use for rollouts
       NOTE: `num_envs` must be divisible by the total number of chips since each
@@ -204,13 +206,25 @@ def train(
 
   assert num_envs % device_count == 0
 
-  v_randomization_fn = None
-  if randomization_fn is not None:
-    randomization_batch_size = num_envs // local_device_count
-    # all devices gets the same randomization rng
-    randomization_rng = jax.random.split(key_env, randomization_batch_size)
-    v_randomization_fn = functools.partial(
-        randomization_fn, rng=randomization_rng
+  env = environment
+  if wrap_env:
+    v_randomization_fn = None
+    if randomization_fn is not None:
+      randomization_batch_size = num_envs // local_device_count
+      # all devices gets the same randomization rng
+      randomization_rng = jax.random.split(key_env, randomization_batch_size)
+      v_randomization_fn = functools.partial(
+          randomization_fn, rng=randomization_rng
+      )
+    if isinstance(environment, envs.Env):
+      wrap_for_training = envs.training.wrap
+    else:
+      wrap_for_training = envs_v1.wrappers.wrap_for_training
+    env = wrap_for_training(
+        environment,
+        episode_length=episode_length,
+        action_repeat=action_repeat,
+        randomization_fn=v_randomization_fn,
     )
 
   env = environment
@@ -386,13 +400,6 @@ def train(
           specs.Array(env_state.obs.shape[-1:], jnp.dtype('float32'))),
       env_steps=0)
 
-  if num_timesteps == 0:
-    return (
-        make_policy,
-        (training_state.normalizer_params, training_state.params),
-        {},
-    )
-
   if (
       restore_checkpoint_path is not None
       and epath.Path(restore_checkpoint_path).exists()
@@ -407,13 +414,19 @@ def train(
         normalizer_params=normalizer_params, params=init_params
     )
 
+  if num_timesteps == 0:
+    return (
+        make_policy,
+        (training_state.normalizer_params, training_state.params),
+        {},
+    )
+
   training_state = jax.device_put_replicated(
       training_state,
       jax.local_devices()[:local_devices_to_use])
 
   if not eval_env:
     eval_env = environment
-
   if wrap_env:
     if randomization_fn is not None:
       v_randomization_fn = functools.partial(
